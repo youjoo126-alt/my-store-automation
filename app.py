@@ -3,9 +3,6 @@ import pandas as pd
 import google.generativeai as genai
 import requests
 import time
-import hmac
-import hashlib
-import base64
 from bs4 import BeautifulSoup
 
 # --- 페이지 설정 ---
@@ -15,56 +12,54 @@ st.set_page_config(page_title="위탁판매 SEO 마스터", layout="wide")
 with st.sidebar:
     st.header("⚙️ 설정 및 API 키")
     gemini_api_key = st.text_input("Gemini API Key", type="password")
-    naver_client_id = st.text_input("Naver API Client ID")
-    naver_client_secret = st.text_input("Naver API Client Secret")
-    naver_customer_id = st.text_input("Naver Customer ID")
+    st.info("네이버 API 없이 상위 판매자 분석 방식으로 작동합니다.")
     
     st.divider()
-    batch_size = 100
-    st.info(f"한 번에 {batch_size}개씩 처리하도록 설정되었습니다.")
+    if st.button("세션 초기화 (처음부터 다시)"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
-# --- 세션 상태 초기화 (데이터 유지용) ---
+# --- 세션 상태 초기화 ---
 if 'raw_df' not in st.session_state: st.session_state.raw_df = None
 if 'batch_df' not in st.session_state: st.session_state.batch_df = None
+if 'edit_df' not in st.session_state: st.session_state.edit_df = None
 if 'final_ready' not in st.session_state: st.session_state.final_ready = False
 
-# --- 주요 함수 정의 ---
-
-def get_naver_headers(method, uri, api_key, secret_key, customer_id):
-    timestamp = str(int(time.time() * 1000))
-    signature = hmac.new(
-        secret_key.encode('utf-8'),
-        f"{timestamp}.{method}.{uri}".encode('utf-8'),
-        hashlib.sha256
-    ).digest()
-    return {
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Timestamp": timestamp,
-        "X-API-KEY": api_key,
-        "X-Customer": str(customer_id),
-        "X-Signature": base64.b64encode(signature).decode('utf-8')
-    }
-
-def get_item_count(keyword):
-    """네이버 쇼핑 등록 상품수 크롤링"""
+# --- 함수: 상위 판매자 키워드 추출 로직 ---
+def get_competitor_keywords(target_name):
     try:
-        url = f"https://search.shopping.naver.com/search/all?query={keyword}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        url = f"https://search.shopping.naver.com/search/all?query={target_name}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        res = requests.get(url, headers=headers, timeout=5)
         soup = BeautifulSoup(res.text, 'html.parser')
-        count_tag = soup.select_one(".result_num") or soup.select_one('span[class^="label_total_"]')
-        if count_tag:
-            count = int(''.join(filter(str.isdigit, count_tag.text)))
-            return count
+        
+        # 상위 상품명들 수집 (네이버 쇼핑 구조 반영)
+        titles = soup.select('a[class^="product_link__"]')
+        
+        all_words = []
+        for title in titles[:10]: # 상위 10개 업체 분석
+            all_words.extend(title.text.strip().split())
+        
+        # 불필요 단어 필터링 (원본 이름에 있는 단어 등 제외)
+        unique_keywords = []
+        for w in all_words:
+            if len(w) > 1 and w not in target_name:
+                unique_keywords.append(w)
+        
+        # 중복 제거 후 상위 15개 반환
+        return ", ".join(list(dict.fromkeys(unique_keywords))[:15])
     except:
-        return 9999999
-    return 1000000
+        return "분석 실패 (직접 입력 권장)"
 
-# --- 화면 구성 시작 ---
-st.title("📦 위탁판매 상품 최적화 자동화 시스템")
+# --- 본문 화면 구성 ---
+st.title("📦 위탁판매 상품 최적화 시스템")
 
-# Step 1: 파일 업로드 및 구간 추출
-st.header("Step 1. 전체 파일 업로드 및 오늘 분량(100개) 추출")
-uploaded_file = st.file_uploader("전체 상품 리스트 엑셀 파일을 업로드하세요", type=["csv", "xlsx"])
+# [Step 1] 파일 업로드 및 100개 추출
+st.header("Step 1. 오늘 작업할 100개 추출")
+uploaded_file = st.file_uploader("전체 리스트 엑셀 파일을 업로드하세요", type=["csv", "xlsx"])
 
 if uploaded_file:
     if st.session_state.raw_df is None:
@@ -74,82 +69,40 @@ if uploaded_file:
             st.session_state.raw_df = pd.read_excel(uploaded_file)
     
     total_rows = len(st.session_state.raw_df)
-    st.write(f"총 {total_rows}개의 상품이 확인되었습니다.")
+    st.write(f"✅ 총 {total_rows}개의 상품 확인됨")
     
-    start_row = st.number_input(f"시작 행 번호 (1 ~ {total_rows})", min_value=1, max_value=total_rows, value=1)
+    start_row = st.number_input(f"시작 행 번호 (1 ~ {total_rows})", min_value=1, value=1)
     
     if st.button("오늘의 100개 추출하기"):
-        st.session_state.batch_df = st.session_state.raw_df.iloc[start_row-1 : start_row-1 + batch_size].copy()
-        st.success(f"{start_row}번부터 {start_row + len(st.session_state.batch_df) - 1}번까지 추출 완료!")
+        st.session_state.batch_df = st.session_state.raw_df.iloc[start_row-1 : start_row-1 + 100].copy()
+        st.success(f"📌 {start_row}번부터 100개 데이터를 가져왔습니다.")
 
-# Step 2: 상품명 간소화 및 검수
+# [Step 2] 상품명 간소화 및 직접 편집
 if st.session_state.batch_df is not None:
     st.divider()
-    st.header("Step 2. AI 상품명 간소화 및 대표님 검수")
+    st.header("Step 2. 상품명 간소화 및 대표님 직접 수정")
     
-    if st.button("AI 상품명 생성 시작 (Gemini)"):
+    if st.button("AI 상품명 초안 생성 (Gemini)"):
         if not gemini_api_key:
-            st.error("Gemini API Key를 입력해주세요.")
+            st.error("왼쪽 사이드바에 Gemini API Key를 입력해주세요.")
         else:
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash')
             
             new_names = []
-            progress_bar = st.progress(0)
+            p_bar = st.progress(0)
             for i, name in enumerate(st.session_state.batch_df['상품명']):
-                prompt = f"상품명 '{name}'을 '소재 특징 + 제품명 + 수량' 형식으로 짧고 간결하게 바꿔줘. 예: 1.5m 다이어트줄자 -> 다이어트 줄자 1.5m. 다른 설명 없이 결과만 보내."
+                prompt = f"상품명 '{name}'을 '소재 특징 + 제품명 + 수량' 형식으로 짧고 간결하게 바꿔줘. 결과만 말해."
                 try:
                     res = model.generate_content(prompt)
                     new_names.append(res.text.strip())
                 except:
                     new_names.append(name)
-                progress_bar.progress((i + 1) / len(st.session_state.batch_df))
+                p_bar.progress((i + 1) / len(st.session_state.batch_df))
             
-            st.session_state.batch_df['변경 상품명'] = new_names
-            st.success("AI 추천 이름 생성 완료! 아래 표에서 직접 수정 후 다음 단계로 넘어가세요.")
+            st.session_state.edit_df = st.session_state.batch_df.copy()
+            st.session_state.edit_df['최종상품명'] = new_names
+            st.success("AI 추천 이름이 생성되었습니다.")
 
-    if '변경 상품명' in st.session_state.batch_df.columns:
-        # 수정 가능한 테이블 제공
-        edited_data = st.data_editor(
-            st.session_state.batch_df[['상품명', '변경 상품명']],
-            use_container_width=True,
-            num_rows="fixed"
-        )
-        # 수정된 내용 반영
-        st.session_state.batch_df['상품명'] = edited_data['변경 상품명']
-
-# Step 3: 키워드 추출
-if st.session_state.batch_df is not None and '변경 상품명' in st.session_state.batch_df.columns:
-    st.divider()
-    st.header("Step 3. 황금 키워드 15개 추출 (네이버 분석)")
-    
-    if st.button("최종 키워드 분석 및 파일 완성"):
-        if not (naver_client_id and naver_client_secret and naver_customer_id):
-            st.error("네이버 API 설정 정보를 모두 입력해주세요.")
-        else:
-            with st.spinner("실시간 검색량 및 상품수 데이터 분석 중... (약 2~3분 소요)"):
-                final_keywords_list = []
-                # 실제 운영 시에는 여기에 네이버 연관키워드 API 호출 로직이 들어갑니다.
-                # 편의상 대표 키워드 기반 경쟁강도 분석 후 15개 매칭하는 시뮬레이션
-                for name in st.session_state.batch_df['상품명']:
-                    # [로직 요약]
-                    # 1. 네이버 API로 연관 키워드 수집
-                    # 2. 각 키워드 검색량/상품수 수집
-                    # 3. 경쟁강도 하위 15개 선정
-                    # 4. 쉼표로 연결
-                    sample_keywords = f"{name} 추천, 가성비 {name}, 인기 {name}, 필수템, 선물용" # 샘플
-                    final_keywords_list.append(sample_keywords)
-                    time.sleep(0.1) # 속도 조절
-                
-                st.session_state.batch_df['키워드'] = final_keywords_list
-                st.session_state.final_ready = True
-                st.success("모든 최적화가 완료되었습니다!")
-
-    if st.session_state.final_ready:
-        csv_data = st.session_state.batch_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="🎉 최적화된 엑셀 파일 다운로드",
-            data=csv_data,
-            file_name="today_optimized_work.csv",
-            mime="text/csv"
-        )
+    if st.session_state.edit_df is not None:
+        st.info("💡 '최종상품명' 칸을 클릭하여 직접 수정할 수
